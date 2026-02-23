@@ -43,6 +43,46 @@ def build_grover_circuit(target: int) -> QuantumCircuit:
     return qc
 
 
+def build_grover_circuit_k(target: int, k: int) -> QuantumCircuit:
+    """
+    Build a 4-qubit Grover circuit with exactly *k* oracle+diffuser iterations.
+
+    k=0  →  H-gate initialisation only (uniform superposition)
+    k=1..3 → k full oracle+diffuser cycles followed by measurement
+    """
+    n = 4
+    qr = QuantumRegister(n, "q")
+    cr = ClassicalRegister(n, "meas")
+    qc = QuantumCircuit(qr, cr)
+
+    qc.h(range(n))
+
+    target_bits   = format(target, f"0{n}b")[::-1]
+    zero_indices  = [i for i in range(n) if target_bits[i] == "0"]
+
+    for _ in range(k):
+        # Oracle
+        if zero_indices:
+            qc.x(zero_indices)
+        qc.h(n - 1)
+        qc.mcx(list(range(n - 1)), n - 1)
+        qc.h(n - 1)
+        if zero_indices:
+            qc.x(zero_indices)
+
+        # Diffuser
+        qc.h(range(n))
+        qc.x(range(n))
+        qc.h(n - 1)
+        qc.mcx(list(range(n - 1)), n - 1)
+        qc.h(n - 1)
+        qc.x(range(n))
+        qc.h(range(n))
+
+    qc.measure(qr, cr)
+    return qc
+
+
 def run_grover(target: int, backend) -> tuple:
     """
     Run Grover's algorithm for the given target on the provided backend.

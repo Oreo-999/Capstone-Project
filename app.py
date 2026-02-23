@@ -1,10 +1,11 @@
+import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 from qiskit_aer import AerSimulator
 
 from config import get_backends
-from algorithms.grover import run_grover
-from algorithms.shor import run_shor
+from algorithms.grover import run_grover, build_grover_circuit_k
+from algorithms.shor import run_shor, VALID_A_VALUES, PERIOD_TABLE
 from algorithms.qaoa import (
     PRESET_GRAPHS,
     COUPLING_MAP_EDGES,
@@ -12,6 +13,7 @@ from algorithms.qaoa import (
     HAS_CVXPY,
     build_qaoa_circuit,
     classical_max_cut,
+    compute_cut_value,
     compute_expected_cut,
     approximation_ratio,
     optimize_qaoa_params,
@@ -24,11 +26,45 @@ from algorithms.qaoa import (
     depth_quality_sweep,
 )
 from visualizations import grover_viz, shor_viz, qaoa_viz
+from visualizations import plotly_viz
 
 
 def plt_close(fig):
     """Close a matplotlib figure to avoid memory leaks across Streamlit reruns."""
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Cached quantum computations
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def cached_grover_step(target: int, k: int):
+    """Run Grover circuit with k iterations on AerSimulator; cached per (target, k)."""
+    from qiskit_aer.primitives import SamplerV2 as AerSampler
+    qc = build_grover_circuit_k(target, k)
+    sampler = AerSampler()
+    job = sampler.run([qc], shots=1024)
+    counts = job.result()[0].data.meas.get_counts()
+    return qc, counts
+
+
+@st.cache_data(show_spinner=False)
+def cached_run_shor(a: int):
+    """Run Shor's algorithm for given base a; cached per a."""
+    return run_shor(a)
+
+
+@st.cache_data(show_spinner=False)
+def cached_optimize_qaoa(n_nodes: int, edges_tuple: tuple, p: int,
+                          grid_size: int, grid_shots: int,
+                          weights_frozen):
+    """Optimise QAOA params; cached by graph/p/weights combination."""
+    edges = list(edges_tuple)
+    weights = dict(weights_frozen) if weights_frozen else None
+    return optimize_qaoa_params(n_nodes, edges, p=p,
+                                grid_size=grid_size, grid_shots=grid_shots,
+                                weights=weights)
 
 
 def show_results_grover(circuit, counts, target):
@@ -98,9 +134,8 @@ def show_results_grover(circuit, counts, target):
         a dramatic demonstration of quantum amplitude amplification.
         """
     )
-    fig_counts = grover_viz.plot_counts(counts, target)
-    st.pyplot(fig_counts)
-    plt_close(fig_counts)
+    fig_counts = plotly_viz.plotly_grover_counts(counts, target)
+    st.plotly_chart(fig_counts, use_container_width=True)
 
     with st.expander("Why isn't the target probability exactly 100%?"):
         st.markdown(
@@ -138,9 +173,8 @@ def show_results_grover(circuit, counts, target):
         search space scales up.
         """
     )
-    fig_complexity = grover_viz.plot_complexity()
-    st.pyplot(fig_complexity)
-    plt_close(fig_complexity)
+    fig_complexity = plotly_viz.plotly_complexity_comparison()
+    st.plotly_chart(fig_complexity, use_container_width=True)
 
     with st.expander("Is this the best possible quantum speedup for search?"):
         st.markdown(
@@ -347,6 +381,15 @@ with tab_grover:
 
     st.divider()
 
+    # ── Mode selector ──────────────────────────────────────────────────────
+    grover_mode = st.radio(
+        "Mode",
+        ["Full Run (3 iterations)", "Step-by-Step Explorer"],
+        horizontal=True,
+        key="grover_mode_radio",
+        help="Full Run executes 3 Grover iterations at once. Step-by-Step lets you advance one iteration at a time and watch the amplitude change.",
+    )
+
     target = st.slider(
         "Select target item to search for (0 – 15)",
         min_value=0, max_value=15, value=7,
@@ -355,37 +398,137 @@ with tab_grover:
     target_bits = format(target, "04b")[::-1]
     st.caption(f"Target {target} in binary (little-endian): `|{target_bits}⟩`")
 
-    run_grover_btn = st.button("Run Grover's Algorithm", key="run_grover", type="primary")
+    # ── Step-by-Step Explorer ──────────────────────────────────────────────
+    if grover_mode == "Step-by-Step Explorer":
+        # Session state initialisation
+        if "grover_iteration" not in st.session_state:
+            st.session_state["grover_iteration"] = 0
+        if "grover_target_locked" not in st.session_state:
+            st.session_state["grover_target_locked"] = target
 
-    if run_grover_btn:
-        if "backends" not in st.session_state:
-            st.error("Please connect to a backend first (use the sidebar).")
+        # Reset when target changes
+        if st.session_state["grover_target_locked"] != target:
+            st.session_state["grover_iteration"] = 0
+            st.session_state["grover_target_locked"] = target
+
+        k = st.session_state["grover_iteration"]
+        N_space = 16
+        theta = np.arcsin(1.0 / np.sqrt(N_space))
+
+        # Metric row
+        grover_prob   = np.sin((2 * k + 1) * theta) ** 2
+        classical_prob = 1 - (15 / 16) ** max(k, 1) if k > 0 else 1 / 16
+
+        st.divider()
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Iterations used", k, help="Number of oracle + diffuser cycles applied")
+        mc2.metric(
+            "Grover P(success)",
+            f"{grover_prob:.1%}",
+            f"{grover_prob - classical_prob:+.1%} vs classical" if k > 0 else None,
+        )
+        mc3.metric("Classical P(found)", f"{classical_prob:.1%}",
+                   help="Probability of finding by random sampling after same # of queries")
+
+        # Navigation buttons
+        btn_col1, btn_col2, btn_col3, btn_col4 = st.columns(4)
+        with btn_col1:
+            if st.button("⏮ Reset", key="grover_reset"):
+                st.session_state["grover_iteration"] = 0
+                st.rerun()
+        with btn_col2:
+            if st.button("◀ Previous", key="grover_prev",
+                         disabled=(k == 0)):
+                st.session_state["grover_iteration"] = max(0, k - 1)
+                st.rerun()
+        with btn_col3:
+            if st.button("Next Iteration ▶", key="grover_next",
+                         disabled=(k >= 3), type="primary"):
+                st.session_state["grover_iteration"] = min(3, k + 1)
+                st.rerun()
+        with btn_col4:
+            if st.button("⏭ Jump to Optimal (3)", key="grover_jump",
+                         disabled=(k == 3)):
+                st.session_state["grover_iteration"] = 3
+                st.rerun()
+
+        # Amplitude chart (analytical — instantaneous, no quantum run needed)
+        st.markdown("#### Amplitude Evolution")
+        if k == 0:
+            st.markdown(
+                "All 16 states have **equal amplitude** 1/√16 ≈ 0.25 after the Hadamard layer. "
+                "No state is preferred yet — click **Next Iteration** to apply the oracle and diffuser."
+            )
         else:
-            backends = st.session_state["backends"]
-            grover_backend = backends["grover_backend"]
+            st.markdown(
+                f"After **{k} iteration{'s' if k > 1 else ''}**: the target state amplitude has grown to "
+                f"**{np.sin((2*k+1)*theta):.4f}** (probability **{grover_prob:.1%}**). "
+                "Every other state is being suppressed by destructive interference."
+            )
+        amp_fig = plotly_viz.plotly_amplitude_step(target, k)
+        st.plotly_chart(amp_fig, use_container_width=True)
 
-            if backends["grover_mode"] == "real":
-                st.info(
-                    f"Job submitted to **{backends['grover_backend_name']}**. "
-                    "Waiting in IBM queue — this may take a few minutes…"
-                )
+        # Actual measurement counts (cached quantum circuit)
+        if k > 0:
+            with st.spinner(f"Running Grover circuit (k={k}) on AerSimulator…"):
+                _, step_counts = cached_grover_step(target, k)
+            target_state_bs = format(target, "04b")[::-1]
+            found = step_counts.get(target_state_bs, 0)
+            total = sum(step_counts.values())
+            st.markdown(
+                f"**Measurement simulation** ({total} shots): target `|{target_state_bs}⟩` "
+                f"found **{found} times ({100*found/total:.1f}%)**"
+            )
+            counts_fig = plotly_viz.plotly_grover_counts(step_counts, target)
+            st.plotly_chart(counts_fig, use_container_width=True)
+        else:
+            st.info("No measurement yet — apply at least 1 iteration to run the circuit.")
 
-            try:
-                with st.spinner("Running Grover's algorithm…"):
-                    circuit, counts = run_grover(target, grover_backend)
-                st.success(f"Job complete on **{backends['grover_backend_name']}**!")
-                show_results_grover(circuit, counts, target)
+        if k == 3:
+            st.success(
+                f"Optimal! After 3 iterations, Grover's finds the target with **{grover_prob:.1%}** probability "
+                f"— classical random search achieves only **{classical_prob:.1%}** in the same 3 queries."
+            )
 
-            except Exception as e:
-                st.error(f"Error on real hardware: {e}")
-                st.info("Auto-switching to AerSimulator fallback…")
+        # Complexity comparison (always visible)
+        st.divider()
+        st.markdown("#### Classical vs Quantum: Queries to Succeed")
+        comp_fig = plotly_viz.plotly_complexity_comparison()
+        st.plotly_chart(comp_fig, use_container_width=True)
+
+    else:
+        # ── Full Run mode ──────────────────────────────────────────────────
+        run_grover_btn = st.button("Run Grover's Algorithm", key="run_grover", type="primary")
+
+        if run_grover_btn:
+            if "backends" not in st.session_state:
+                st.error("Please connect to a backend first (use the sidebar).")
+            else:
+                backends = st.session_state["backends"]
+                grover_backend = backends["grover_backend"]
+
+                if backends["grover_mode"] == "real":
+                    st.info(
+                        f"Job submitted to **{backends['grover_backend_name']}**. "
+                        "Waiting in IBM queue — this may take a few minutes…"
+                    )
+
                 try:
-                    with st.spinner("Retrying on AerSimulator…"):
-                        circuit, counts = run_grover(target, AerSimulator())
-                    st.success("Fallback run complete on AerSimulator!")
+                    with st.spinner("Running Grover's algorithm…"):
+                        circuit, counts = run_grover(target, grover_backend)
+                    st.success(f"Job complete on **{backends['grover_backend_name']}**!")
                     show_results_grover(circuit, counts, target)
-                except Exception as e2:
-                    st.error(f"Fallback also failed: {e2}")
+
+                except Exception as e:
+                    st.error(f"Error on real hardware: {e}")
+                    st.info("Auto-switching to AerSimulator fallback…")
+                    try:
+                        with st.spinner("Retrying on AerSimulator…"):
+                            circuit, counts = run_grover(target, AerSimulator())
+                        st.success("Fallback run complete on AerSimulator!")
+                        show_results_grover(circuit, counts, target)
+                    except Exception as e2:
+                        st.error(f"Fallback also failed: {e2}")
 
 # ===========================================================================
 # SHOR TAB
@@ -454,15 +597,43 @@ with tab_shor:
 
     st.divider()
 
+    # ── Parameter exploration ──────────────────────────────────────────────
+    col_shor_a, col_shor_info = st.columns([1, 2])
+    with col_shor_a:
+        a_value = st.selectbox(
+            "Base a (coprime to 15)",
+            VALID_A_VALUES,
+            index=0,
+            help="The random base for modular exponentiation. Different values give different circuits but all factor 15 = 3 × 5.",
+        )
+    with col_shor_info:
+        expected_r = PERIOD_TABLE[a_value]
+        st.markdown(
+            f"**Selected:** a = {a_value}  |  Expected period: **r = {expected_r}**  |  "
+            f"{a_value}^r mod 15 = {pow(a_value, expected_r, 15)} ✓"
+        )
+
+    with st.expander("Period table for all valid bases"):
+        rows = "| a | Period r | aʳ mod 15 | Gives factors? |\n|---|----------|-----------|----------------|\n"
+        for av in VALID_A_VALUES:
+            r_ = PERIOD_TABLE[av]
+            ok = "✓" if r_ % 2 == 0 else "✗ (odd period)"
+            rows += f"| {av} | {r_} | {pow(av, r_, 15)} | {ok} |\n"
+        st.markdown(rows)
+        st.caption(
+            "Bases with odd period (11, 14) don't directly yield factors via gcd — "
+            "Shor's algorithm would retry with a different a. Bases 2, 4, 7, 8, 13 all work."
+        )
+
     run_shor_btn = st.button("Run on Simulator", key="run_shor", type="primary")
 
     if run_shor_btn:
         try:
-            with st.spinner("Running Shor's algorithm on AerSimulator (2048 shots)…"):
-                circuit, counts, period, factors = run_shor()
+            with st.spinner(f"Running Shor's algorithm  (a={a_value}, N=15)  on AerSimulator (2048 shots)…"):
+                circuit, counts, period, factors = cached_run_shor(a_value)
 
             st.success(
-                f"Factoring complete!  Detected period **r = {period}**  →  "
+                f"Factoring complete!  a = {a_value}  →  Detected period **r = {period}**  →  "
                 f"**15 = {factors[0]} × {factors[1]}**"
             )
 
@@ -471,25 +642,24 @@ with tab_shor:
             # --- Circuit ---
             st.markdown("### Circuit Diagram")
             st.markdown(
-                """
-                This 8-qubit circuit is the full Shor's algorithm for N=15, a=2.
+                f"""
+                This 8-qubit circuit is the full Shor's algorithm for N=15, **a={a_value}**.
 
                 **Top 4 wires — counting register (`count`):**
                 These start in superposition (H gates) and their final measurement reveals the
                 phase of the modular exponentiation. After the inverse QFT, peaks appear at
-                positions that are multiples of 2⁴/r = 4, which encodes the period r.
+                positions that are multiples of 2⁴/r, which encodes the period r.
 
                 **Bottom 4 wires — work register (`work`):**
-                Initialized to |0001⟩. The controlled-U gates act on this register to compute
-                `a^x mod N` coherently. The work register is *not* measured — it's traced out
-                after the computation, acting as a "scratchpad" that entangles with the counting register.
+                Initialized to |0001⟩. The controlled-U gates compute `{a_value}^x mod 15`
+                coherently. The work register is *not* measured — it entangles with the
+                counting register as a quantum scratchpad.
 
-                **Controlled-U gates:** Each one represents "multiply the work register by 2 mod 15,
-                controlled on the corresponding counting qubit." Internally implemented as
-                a sequence of SWAP gates (cyclic left shift = multiply by 2 in binary for this case).
+                **Controlled-U gates:** Each one represents "multiply the work register by
+                {a_value} mod 15, controlled on the corresponding counting qubit."
 
-                **QFT⁻¹ block:** The inverse Quantum Fourier Transform at the end. This is the
-                heart of the speedup — it converts the periodic entanglement into measurable phase peaks.
+                **QFT⁻¹ block:** The inverse Quantum Fourier Transform converts the periodic
+                entanglement into measurable phase peaks.
                 """
             )
             fig_circuit = shor_viz.plot_circuit(circuit)
@@ -516,9 +686,8 @@ with tab_shor:
                 and finite sampling, but the pattern is clear.
                 """
             )
-            fig_counts = shor_viz.plot_counts(counts)
-            st.pyplot(fig_counts)
-            plt_close(fig_counts)
+            fig_counts = plotly_viz.plotly_shor_phases(counts, a=a_value)
+            st.plotly_chart(fig_counts, use_container_width=True)
 
             with st.expander("How do we get the period from these measurements?"):
                 st.markdown(
@@ -548,23 +717,36 @@ with tab_shor:
 
             # --- Derivation ---
             st.markdown("### Factor Derivation")
-            st.markdown(
-                f"""
-                With the period **r = {period}** confirmed, the final step is pure classical math
-                using the **greatest common divisor (gcd)**:
+            if period % 2 == 0:
+                half_power = a_value ** (period // 2)
+                st.markdown(
+                    f"""
+                    With the period **r = {period}** confirmed, the final step is pure classical math
+                    using the **greatest common divisor (gcd)**:
 
-                The key theorem (Euler's): if `a^r ≡ 1 (mod N)` then `(a^(r/2))² ≡ 1 (mod N)`,
-                which means `N` divides `(a^(r/2) − 1)(a^(r/2) + 1)`.
-                So the factors of N are "hiding" in gcd(a^(r/2) ± 1, N).
+                    The key theorem (Euler's): if `a^r ≡ 1 (mod N)` then `(a^(r/2))² ≡ 1 (mod N)`,
+                    which means `N` divides `(a^(r/2) − 1)(a^(r/2) + 1)`.
+                    So the factors of N are "hiding" in gcd(a^(r/2) ± 1, N).
 
-                | Computation | Value |
-                |-------------|-------|
-                | a = 2, r = {period}, so a^(r/2) = 2^{period//2} | = **{2**(period//2)}** |
-                | gcd(2^{period//2} − 1, 15) = gcd({2**(period//2)-1}, 15) | = **{factors[0]}** |
-                | gcd(2^{period//2} + 1, 15) = gcd({2**(period//2)+1}, 15) | = **{factors[1]}** |
-                | Result | **15 = {factors[0]} × {factors[1]}** ✓ |
-                """
-            )
+                    | Computation | Value |
+                    |-------------|-------|
+                    | a = {a_value}, r = {period}, so a^(r/2) = {a_value}^{period//2} | = **{half_power}** |
+                    | gcd({half_power} − 1, 15) = gcd({half_power-1}, 15) | = **{factors[0]}** |
+                    | gcd({half_power} + 1, 15) = gcd({half_power+1}, 15) | = **{factors[1]}** |
+                    | Result | **15 = {factors[0]} × {factors[1]}** ✓ |
+                    """
+                )
+            else:
+                st.markdown(
+                    f"""
+                    Period **r = {period}** is **odd** for a = {a_value}.
+                    This means the standard gcd trick doesn't apply directly — in a full implementation
+                    of Shor's algorithm the circuit would retry with a different random base.
+                    The known factors 3 and 5 are returned as the result.
+
+                    | Result | **15 = {factors[0]} × {factors[1]}** |
+                    """
+                )
             fig_deriv = shor_viz.plot_derivation(period, factors)
             st.pyplot(fig_deriv)
             plt_close(fig_deriv)
@@ -792,7 +974,7 @@ with tab_qaoa:
     weights    = graph_data.get("weights") if use_weights else None
 
     # Compute max_cut dynamically (works for both weighted and unweighted)
-    max_cut, _ = classical_max_cut(n_nodes, edges, weights)
+    max_cut, best_partition = classical_max_cut(n_nodes, edges, weights)
 
     st.caption(
         f"**{n_nodes} nodes · {len(edges)} edges** · "
@@ -800,6 +982,127 @@ with tab_qaoa:
         f"Classical optimum C* = **{max_cut:.2f}** · "
         f"{n_nodes} qubits"
     )
+
+    # ── Guess the Cut Challenge ────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Challenge: Guess the Maximum Cut")
+    st.markdown(
+        "Assign each node to **Set 0 (blue)** or **Set 1 (red)** to maximise the number of "
+        "cut edges. Then submit your guess to see how it compares to QAOA and the classical optimum!"
+    )
+
+    # Reset challenge state when graph or weights change
+    _challenge_key = f"{graph_choice}_{use_weights}"
+    if st.session_state.get("qaoa_guess_graph_key") != _challenge_key:
+        st.session_state["qaoa_guess_graph_key"]  = _challenge_key
+        st.session_state["qaoa_guess_partition"]  = {i: 0 for i in range(n_nodes)}
+        st.session_state["qaoa_guess_submitted"]  = False
+        st.session_state["qaoa_challenge_result"] = None
+
+    # Node coloring controls
+    node_cols = st.columns(n_nodes)
+    for i, col in enumerate(node_cols):
+        with col:
+            choice = st.radio(
+                f"Node {i}",
+                options=[0, 1],
+                format_func=lambda x: "Blue S₀" if x == 0 else "Red S₁",
+                key=f"qaoa_node_{i}_{_challenge_key}",
+                index=st.session_state["qaoa_guess_partition"].get(i, 0),
+            )
+            st.session_state["qaoa_guess_partition"][i] = choice
+
+    # Live cut value
+    user_partition = [st.session_state["qaoa_guess_partition"].get(i, 0) for i in range(n_nodes)]
+    user_cut = sum(
+        (weights.get((u, v)) or weights.get((v, u)) or 1.0) if weights else 1.0
+        for (u, v) in edges
+        if user_partition[u] != user_partition[v]
+    )
+
+    uc1, uc2 = st.columns(2)
+    uc1.metric(
+        "Your current cut value",
+        f"{user_cut:.2f}",
+        f"{user_cut / max_cut:.0%} of optimal C* = {max_cut:.2f}",
+    )
+
+    # Live graph preview updates as user toggles nodes
+    with uc2:
+        preview_fig = qaoa_viz.plot_graph(
+            n_nodes, edges, pos,
+            partition=user_partition,
+            weights=weights,
+            title=f"Your Partition (cut = {user_cut:.2f})",
+        )
+        st.pyplot(preview_fig)
+        plt_close(preview_fig)
+
+    # Submit button
+    submit_btn = st.button("Submit My Cut & Run QAOA", key="qaoa_submit_guess", type="primary")
+
+    if submit_btn:
+        st.session_state["qaoa_guess_submitted"] = True
+        st.session_state["qaoa_guess_user_cut"]  = user_cut
+        st.session_state["qaoa_guess_partition_snap"] = user_partition[:]
+
+    # Show challenge results if submitted
+    if st.session_state.get("qaoa_guess_submitted"):
+        locked_user_cut = st.session_state.get("qaoa_guess_user_cut", user_cut)
+        locked_partition = st.session_state.get("qaoa_guess_partition_snap", user_partition)
+
+        # Run QAOA optimisation (cached)
+        with st.spinner("Running QAOA optimisation…"):
+            try:
+                edges_tuple   = tuple(tuple(e) for e in edges)
+                weights_frozen = frozenset(weights.items()) if weights else None
+                opt_gamma_c, opt_beta_c, opt_exp_c, _ = cached_optimize_qaoa(
+                    n_nodes, edges_tuple, 1, 10, 256, weights_frozen
+                )
+                qaoa_cut = opt_exp_c
+            except Exception:
+                qaoa_cut = None
+
+        if not HAS_CVXPY:
+            gw_cut = None
+        else:
+            with st.spinner("Running Goemans-Williamson…"):
+                try:
+                    gw_res = goemans_williamson(n_nodes, edges, weights=weights, n_rounds=100)
+                    gw_cut = gw_res["gw_cut"]
+                except Exception:
+                    gw_cut = None
+
+        st.divider()
+        st.markdown("#### Your Results vs Algorithms")
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        rc1.metric("Your Cut",          f"{locked_user_cut:.2f}",
+                   f"{locked_user_cut/max_cut:.0%} of C*")
+        rc2.metric("QAOA Ideal ⟨C⟩",   f"{qaoa_cut:.3f}" if qaoa_cut is not None else "—",
+                   f"{qaoa_cut/max_cut:.0%} of C*" if qaoa_cut else None)
+        rc3.metric("Goemans-Williamson", f"{gw_cut:.2f}" if gw_cut is not None else "—",
+                   f"{gw_cut/max_cut:.0%} of C*" if gw_cut else None)
+        rc4.metric("Classical C*",       f"{max_cut:.2f}", "100%", delta_color="off")
+
+        if qaoa_cut is not None and locked_user_cut >= qaoa_cut:
+            st.success(
+                f"You beat QAOA! Your cut ({locked_user_cut:.2f}) ≥ QAOA ({qaoa_cut:.3f}). "
+                "Human intuition wins this round — try a harder graph!"
+            )
+        elif gw_cut is not None and locked_user_cut >= gw_cut:
+            st.info(
+                f"You matched or beat the Goemans-Williamson algorithm ({gw_cut:.2f})! "
+                "That's impressive — GW is the best known classical approximation."
+            )
+        elif qaoa_cut is not None:
+            st.warning(
+                f"QAOA ({qaoa_cut:.3f}) beat your cut ({locked_user_cut:.2f}). "
+                "Try recolouring the nodes — can you do better?"
+            )
+
+        st.caption("Scroll down to run the full QAOA analysis and see all the details.")
+
+    st.divider()
 
     run_btn = st.button("Run Full QAOA Analysis", type="primary", key="run_qaoa")
 
@@ -863,11 +1166,11 @@ with tab_qaoa:
                 opt_gamma, opt_beta, opt_exp, ld = [0.5]*p_layers, [0.3]*p_layers, 0.0, None
 
         if ld is not None and p_layers == 1:
-            fig = qaoa_viz.plot_optimization_landscape(
+            fig = plotly_viz.plotly_optimization_landscape(
                 ld[0], ld[1], ld[2], opt_gamma[0], opt_beta[0],
                 graph_choice.split("(")[0].strip()
             )
-            st.pyplot(fig); plt_close(fig)
+            st.plotly_chart(fig, use_container_width=True)
 
         st.divider()
 
@@ -956,8 +1259,8 @@ with tab_qaoa:
                     sweep = noise_sweep(opt_circuit, edges, n_nodes,
                                         scale_factors=[0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0],
                                         shots=1024, weights=weights)
-                    fig = qaoa_viz.plot_noise_sweep(sweep, max_cut)
-                    st.pyplot(fig); plt_close(fig)
+                    fig = plotly_viz.plotly_noise_sweep(sweep, max_cut)
+                    st.plotly_chart(fig, use_container_width=True)
                 except Exception as e:
                     st.error(f"Noise sweep failed: {e}")
 
