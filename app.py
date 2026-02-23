@@ -274,6 +274,15 @@ with st.sidebar:
         type="password",
         placeholder="Paste your API key here",
     )
+    instance = st.text_input(
+        "Instance",
+        placeholder="ibm-q/open/main",
+        help=(
+            "Your IBM Quantum instance in hub/group/project format. "
+            "Free-tier users: leave blank or use ibm-q/open/main. "
+            "Find yours at quantum.ibm.com → your account → instances."
+        ),
+    )
     use_fallback = st.toggle(
         "Use Simulator (skip IBM queue)",
         value=False,
@@ -283,7 +292,9 @@ with st.sidebar:
     if st.button("Connect", use_container_width=True):
         with st.spinner("Connecting to backend…"):
             backends = get_backends(
-                api_key=api_key or None, use_simulator_fallback=use_fallback
+                api_key=api_key or None,
+                instance=instance or None,
+                use_simulator_fallback=use_fallback,
             )
             st.session_state["backends"] = backends
         st.success("Connected!")

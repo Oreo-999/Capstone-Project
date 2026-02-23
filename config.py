@@ -1,7 +1,8 @@
 from qiskit_aer import AerSimulator
 
 
-def get_backends(api_key: str = None, use_simulator_fallback: bool = True) -> dict:
+def get_backends(api_key: str = None, instance: str = None,
+                 use_simulator_fallback: bool = True) -> dict:
     """
     Initialize and return backend objects for Grover's and Shor's algorithms.
 
@@ -29,7 +30,12 @@ def get_backends(api_key: str = None, use_simulator_fallback: bool = True) -> di
     try:
         from qiskit_ibm_runtime import QiskitRuntimeService
 
-        service = QiskitRuntimeService(channel="ibm_quantum_platform", token=api_key)
+        # instance format: "ibm-q/open/main" (open plan) or your hub/group/project
+        service = QiskitRuntimeService(
+            channel="ibm_quantum_platform",
+            token=api_key,
+            instance=instance or "ibm-q/open/main",
+        )
         backend = service.least_busy(
             operational=True, simulator=False, min_num_qubits=4
         )
