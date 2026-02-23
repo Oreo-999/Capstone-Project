@@ -31,11 +31,10 @@ def get_backends(api_key: str = None, instance: str = None,
         from qiskit_ibm_runtime import QiskitRuntimeService
 
         # instance format: "ibm-q/open/main" (open plan) or your hub/group/project
-        service = QiskitRuntimeService(
-            channel="ibm_quantum_platform",
-            token=api_key,
-            instance=instance or "ibm-q/open/main",
-        )
+        kwargs = {"channel": "ibm_quantum_platform", "token": api_key}
+        if instance:
+            kwargs["instance"] = instance
+        service = QiskitRuntimeService(**kwargs)
         backend = service.least_busy(
             operational=True, simulator=False, min_num_qubits=4
         )

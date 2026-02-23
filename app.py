@@ -275,12 +275,12 @@ with st.sidebar:
         placeholder="Paste your API key here",
     )
     instance = st.text_input(
-        "Instance",
-        placeholder="ibm-q/open/main",
+        "Instance CRN (optional)",
+        placeholder="Leave blank to auto-select",
         help=(
-            "Your IBM Quantum instance in hub/group/project format. "
-            "Free-tier users: leave blank or use ibm-q/open/main. "
-            "Find yours at quantum.ibm.com → your account → instances."
+            "Leave blank — IBM will automatically select your first available instance. "
+            "If you have multiple instances and want a specific one, paste its CRN "
+            "(crn:v1:bluemix:...) from quantum.cloud.ibm.com → Instances → hover CRN → copy."
         ),
     )
     use_fallback = st.toggle(
