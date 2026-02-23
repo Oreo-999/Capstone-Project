@@ -29,7 +29,7 @@ def get_backends(api_key: str = None, use_simulator_fallback: bool = True) -> di
     try:
         from qiskit_ibm_runtime import QiskitRuntimeService
 
-        service = QiskitRuntimeService(channel="ibm_quantum", token=api_key)
+        service = QiskitRuntimeService(channel="ibm_quantum_platform", token=api_key)
         backend = service.least_busy(
             operational=True, simulator=False, min_num_qubits=4
         )
