@@ -9,6 +9,7 @@ from algorithms.qaoa import (
     PRESET_GRAPHS,
     COUPLING_MAP_EDGES,
     PHYS_QUBIT_POS,
+    HAS_CVXPY,
     build_qaoa_circuit,
     classical_max_cut,
     compute_expected_cut,
@@ -17,6 +18,8 @@ from algorithms.qaoa import (
     build_ibm_noise_model,
     compare_transpilation_levels,
     run_three_way_comparison,
+    run_zne,
+    goemans_williamson,
     noise_sweep,
     depth_quality_sweep,
 )
@@ -665,691 +668,479 @@ with tab_shor:
         except Exception as e:
             st.error(f"Error running Shor's algorithm: {e}")
 
+
 # ===========================================================================
-# QAOA TAB — Quantum Approximate Optimization Algorithm · Max-Cut
+# QAOA TAB
 # ===========================================================================
 with tab_qaoa:
     st.subheader("QAOA: Quantum Approximate Optimization Algorithm")
 
-    # ── Introduction ────────────────────────────────────────────────────────
     st.markdown(
         """
-        **The problem:** Maximum Cut (Max-Cut) asks you to partition the vertices of a graph
-        into two sets so that the number of edges crossing between them is as large as possible.
-        It is **NP-hard** in general — no polynomial-time classical algorithm is known.
-        Yet it appears naturally in hundreds of real-world settings: logistics routing,
-        portfolio optimisation, VLSI layout, community detection in social networks, and more.
+        **The problem:** Maximum Cut (Max-Cut) — partition vertices of a graph so that the
+        number (or total weight) of edges crossing between partitions is maximised.
+        It is **NP-hard** in general and appears in logistics, finance, drug discovery,
+        energy-grid optimisation, and social-network analysis.
 
         **The quantum insight:** QAOA (Farhi, Goldstone & Gutmann, 2014) is a *variational
-        hybrid* algorithm — it uses a parameterised quantum circuit to prepare a quantum state
-        that encodes approximate solutions, then uses classical optimisation to tune the
-        circuit angles toward the optimal partition.
+        hybrid* algorithm that uses a parameterised quantum circuit to encode approximate
+        solutions and a classical optimiser to tune the circuit angles.
 
-        Unlike Grover's or Shor's (which are fixed, exact algorithms), QAOA is *approximate*
-        and *heuristic*: its quality improves as the number of circuit layers **p** grows,
-        but so does its susceptibility to noise. This makes QAOA one of the most important
-        algorithms for studying the **near-term quantum advantage** question on NISQ hardware.
+        **New in this version:**
+        - **Weighted Max-Cut** — edges carry real-valued weights; the circuit scales ZZ rotation
+          angles accordingly.
+        - **Zero-Noise Extrapolation (ZNE)** — run at noise scales λ=1–4, fit a polynomial,
+          extrapolate to λ=0 for a noiseless estimate.
+        - **Goemans–Williamson SDP** — classical 0.878-approximation benchmark solved via
+          semidefinite programming + hyperplane rounding, providing a direct quantum vs. classical
+          comparison.
         """
     )
 
-    with st.expander("How does QAOA work? (Step-by-step)"):
+    with st.expander("How does QAOA work?"):
         st.markdown(
             """
-            **The Max-Cut cost function:**
-            For a graph G = (V, E), assign each vertex a spin ±1.  The number of edges cut
-            equals ½ Σ_{(u,v)∈E} (1 − zᵤ zᵥ), where zᵢ ∈ {+1, −1}.  In quantum notation,
-            replace zᵢ with the Pauli Z operator; the cost Hamiltonian is:
+            **Weighted cost Hamiltonian:**
 
-            > H_C = ½ Σ_{(u,v)∈E} (I − Zᵤ Zᵥ)
+            > H_C = Σ_{(u,v)∈E} w_{uv} · (I − Z_u Z_v) / 2
 
-            **The QAOA ansatz (p layers):**
-            Starting from the equal superposition |+⟩^⊗n, alternate two unitary operators:
+            Each ZZ term is implemented as **CNOT – Rz(2·w·γ) – CNOT**.  Heavier edges
+            rotate further, naturally prioritising high-weight cuts.
 
-            | Operator | Formula | Role |
-            |----------|---------|------|
-            | **Cost** U_C(γ) | exp(−i γ H_C) | Encodes the objective — edges with high cost accumulate phase |
-            | **Mixer** U_B(β) | exp(−i β Σᵢ Xᵢ) | Mixes amplitudes between states — prevents getting trapped |
+            **Circuit layers (p):**
+            - Cost layer: apply exp(−i γ H_C) — phase-encodes the objective
+            - Mixer layer: apply exp(−i β Σ Xᵢ) — mixes amplitudes to explore the space
 
-            Each U_C layer is implemented as CNOT–Rz(2γ)–CNOT per edge.
-            Each U_B layer is Rx(2β) on every qubit.
-
-            **Classical optimisation loop:**
-            Measure the circuit to estimate ⟨C⟩ = ⟨ψ(γ,β)|H_C|ψ(γ,β)⟩.
-            Adjust angles (γ, β) using a classical optimiser (grid search → Nelder-Mead) to
-            maximise ⟨C⟩.  The best bitstring observed is the candidate solution.
-
-            **Approximation guarantee (p=1):**
-            For any graph, QAOA with p=1 achieves at least **0.6924 × C*** (the optimal cut)
-            — better than the best known classical poly-time algorithm in some regimes.
-            With p→∞, QAOA converges to exact (adiabatic theorem).
+            **Classical outer loop:** measure ⟨C⟩, adjust (γ, β) to maximise it.
             """
         )
 
-    with st.expander("Why is Max-Cut important for society?"):
+    with st.expander("What is Zero-Noise Extrapolation?"):
         st.markdown(
             """
-            **Logistics & Supply Chain**
-            Graph partitioning underlies vehicle routing, warehouse zone assignment, and
-            network traffic splitting. A near-optimal partition can reduce fuel costs and
-            delivery times at scale — millions of dollars of savings for large operators.
+            ZNE is an *error mitigation* technique that doesn't require extra qubits.
 
-            **Energy Grid Optimisation**
-            Splitting a power network into balanced partitions minimises inter-zone power flow,
-            reducing transmission losses.  Quantum-assisted grid optimisation could accelerate
-            the transition to renewable energy by making distributed grids more efficient.
+            1. Run the circuit at noise levels λ=1, 2, 3, 4 (achieved by scaling the noise
+               model, or on real hardware by *gate folding*: replace G → G·G†·G).
+            2. Fit a polynomial to ⟨C(λ)⟩.
+            3. Extrapolate to λ=0 — the estimated noiseless value.
 
-            **Finance & Portfolio Optimisation**
-            Risk diversification in a portfolio is equivalent to finding a partition of assets
-            that minimises correlation (cuts edges in a correlation graph).  Banks and hedge
-            funds are actively investigating QAOA-like methods.
+            ZNE is used in production by IBM Quantum and Google for NISQ experiments and is
+            far more powerful than measurement error mitigation alone, since it also addresses
+            gate errors.
+            """
+        )
 
-            **Drug Discovery & Molecular Simulation**
-            Protein conformational analysis and drug-target binding problems map onto QUBO
-            (Quadratic Unconstrained Binary Optimisation) — the same mathematical class as
-            Max-Cut.  QAOA circuits could help identify candidate drug molecules faster.
+    with st.expander("What is the Goemans–Williamson algorithm?"):
+        st.markdown(
+            """
+            GW (1995) is the best known *classical* polynomial-time approximation algorithm
+            for Max-Cut.  It achieves ≥ **0.878 × C*** in expectation.
 
-            **Machine Learning**
-            Training certain quantum neural networks and performing quantum clustering reduces
-            to Max-Cut on similarity graphs.  Quantum-enhanced ML could speed up the training
-            of large models.
+            **Steps:**
+            1. Solve the SDP relaxation: assign a unit vector **v**ᵢ ∈ ℝⁿ to each vertex so
+               that the objective Σ w_{uv}(1−**v**ᵤ·**v**ᵥ)/2 is maximised.
+            2. Choose a random hyperplane (unit vector **r**).
+            3. Assign vertex i to set 0 if **v**ᵢ·**r** ≥ 0, else set 1.
+            4. Repeat 200 times, take the best cut.
 
-            **Fundamental Science**
-            QAOA is a testbed for *quantum advantage* on NISQ hardware.  Demonstrating that
-            a quantum circuit beats all classical algorithms — even on a small graph — would
-            be a landmark result in computer science.
+            Comparing QAOA against GW directly answers the core question:
+            *"Does the quantum circuit beat the best classical polynomial-time method?"*
+            """
+        )
 
-            **Current Reality & Honest Limitations**
-            Today's NISQ devices (50–1000 qubits, error rate ~0.1–1% per gate) can run QAOA
-            circuits with p=1–3 on graphs of up to ~20 nodes.  Classical simulation remains
-            competitive for small instances.  Fault-tolerant quantum computers (requiring
-            ~1,000× more physical qubits per logical qubit) are needed for genuine quantum
-            advantage on industrially relevant problem sizes.  The scientific community
-            estimates this is 5–15 years away — but the algorithmic and hardware groundwork
-            being laid today is critical.
+    with st.expander("Societal impact of quantum optimisation"):
+        st.markdown(
+            """
+            **Logistics:** Max-Cut and its relatives (QUBO, Ising models) underpin vehicle
+            routing, warehouse zone assignment, and supply-chain balancing.
+
+            **Finance:** Risk-minimising portfolio diversification maps to finding minimum-weight
+            cuts in asset-correlation graphs.
+
+            **Energy:** Splitting power grids into balanced partitions reduces inter-zone
+            transmission losses — critical for integrating renewable energy sources.
+
+            **Drug discovery:** Protein folding and docking problems reduce to QUBO, the same
+            class as weighted Max-Cut.
+
+            **Machine learning:** Quantum-enhanced clustering and graph neural networks use
+            QAOA-like circuits as subroutines.
+
+            **Current reality:** NISQ hardware (50–1000 qubits, ~0.5–1% CX error) can run
+            QAOA at p=1–3 for graphs up to ~20 nodes.  Fault-tolerant machines are estimated
+            5–15 years away but will unlock industrially relevant problem sizes.
             """
         )
 
     st.divider()
 
-    # ── User Controls ────────────────────────────────────────────────────────
-    col_cfg1, col_cfg2 = st.columns([1, 1])
-    with col_cfg1:
-        graph_choice = st.selectbox(
-            "Select graph",
-            list(PRESET_GRAPHS.keys()),
-            index=0,
-            help="The quantum register has one qubit per graph vertex.",
-        )
-    with col_cfg2:
-        p_layers = st.selectbox(
-            "QAOA layers  (p)",
-            [1, 2, 3],
-            index=0,
-            help="More layers → better approximation but deeper (noisier) circuit.",
-        )
+    # ── Controls ────────────────────────────────────────────────────────────
+    col_a, col_b, col_c = st.columns([2, 1, 1])
+    with col_a:
+        graph_choice = st.selectbox("Select graph", list(PRESET_GRAPHS.keys()))
+    with col_b:
+        p_layers = st.selectbox("QAOA layers (p)", [1, 2, 3], index=0)
+    with col_c:
+        use_weights = st.toggle("Weighted edges", value=True,
+                                help="Use non-uniform edge weights in the cost Hamiltonian.")
 
     graph_data = PRESET_GRAPHS[graph_choice]
-    n_nodes = graph_data["n_nodes"]
-    edges   = graph_data["edges"]
-    max_cut = graph_data["max_cut"]
-    pos     = graph_data["pos"]
+    n_nodes    = graph_data["n_nodes"]
+    edges      = graph_data["edges"]
+    pos        = graph_data["pos"]
+    weights    = graph_data.get("weights") if use_weights else None
+
+    # Compute max_cut dynamically (works for both weighted and unweighted)
+    max_cut, _ = classical_max_cut(n_nodes, edges, weights)
 
     st.caption(
-        f"Graph: **{n_nodes} nodes**, **{len(edges)} edges** · "
-        f"Optimal Max-Cut: **C* = {max_cut}** · "
-        f"QAOA circuit uses **{n_nodes} qubits**"
+        f"**{n_nodes} nodes · {len(edges)} edges** · "
+        f"{'Weighted' if use_weights else 'Unweighted'} · "
+        f"Classical optimum C* = **{max_cut:.2f}** · "
+        f"{n_nodes} qubits"
     )
 
-    run_qaoa_btn = st.button("Run Full QAOA Analysis", type="primary", key="run_qaoa")
+    run_btn = st.button("Run Full QAOA Analysis", type="primary", key="run_qaoa")
 
-    if run_qaoa_btn:
-        # ── 1. Classical optimal solution ──────────────────────────────────
-        with st.spinner("Computing classical optimal solution…"):
-            best_cut_val, best_partition = classical_max_cut(n_nodes, edges)
+    if run_btn:
+        # ── 1. Classical solution ──────────────────────────────────────────
+        best_cut_val, best_partition = classical_max_cut(n_nodes, edges, weights)
 
         st.divider()
-        st.markdown("### The Graph and Its Optimal Max-Cut")
+        st.markdown("### Graph and Classical Optimal Partition")
+        weight_note = " — edge labels show weights" if use_weights else ""
         st.markdown(
-            f"""
-            The graph below has **{n_nodes} vertices** and **{len(edges)} edges**.
-            The classical brute-force solution (feasible only for small graphs) finds
-            the optimal partition that cuts **{best_cut_val}** edges — this is the
-            benchmark against which we measure QAOA's performance.
-
-            **Left** — the unpartitioned graph.
-            **Right** — the optimal two-colouring.
-            *Blue* vertices are in set S₀, *red* vertices in set S₁.
-            *Orange* edges are cut; *grey dashed* edges are inside the same partition.
-            """
+            f"Brute-force optimal: **{best_cut_val:.2f}** weighted edges cut{weight_note}. "
+            "Blue = set S₀, red = set S₁.  Orange edges are cut; dashed grey edges are not."
         )
-
         col_g1, col_g2 = st.columns(2)
         with col_g1:
-            fig_g_plain = qaoa_viz.plot_graph(n_nodes, edges, pos, title="Input Graph")
-            st.pyplot(fig_g_plain)
-            plt_close(fig_g_plain)
+            fig = qaoa_viz.plot_graph(n_nodes, edges, pos, weights=weights, title="Input Graph")
+            st.pyplot(fig); plt_close(fig)
         with col_g2:
-            fig_g_cut = qaoa_viz.plot_graph(
-                n_nodes, edges, pos, partition=best_partition,
-                title=f"Optimal Max-Cut (C* = {best_cut_val})"
-            )
-            st.pyplot(fig_g_cut)
-            plt_close(fig_g_cut)
+            fig = qaoa_viz.plot_graph(n_nodes, edges, pos, partition=best_partition,
+                                      weights=weights, title=f"Optimal Cut (C*={best_cut_val:.2f})")
+            st.pyplot(fig); plt_close(fig)
 
-        with st.expander("Why is Max-Cut NP-hard?"):
+        with st.expander("Why does edge weight change the QAOA circuit?"):
             st.markdown(
                 """
-                For a graph with n vertices there are 2^(n−1) distinct partitions (up to
-                reflection).  Checking all of them takes exponential time.  No polynomial-time
-                classical algorithm is known that guarantees the optimum (unless P = NP),
-                so the best classical algorithms are *approximation* algorithms.
+                In the weighted cost Hamiltonian H_C = Σ w_{uv}(I−Z_u Z_v)/2, each term
+                contributes proportionally to its weight.  The corresponding ZZ rotation angle
+                becomes **Rz(2·w·γ)** — heavier edges rotate further, encoding more phase
+                information about that edge's importance.  The optimiser then learns angles that
+                simultaneously maximise the total weighted cut.
 
-                The **Goemans-Williamson** (1995) SDP-based algorithm achieves a 0.878 × C*
-                approximation guarantee, the best known for general graphs.  QAOA with p=1
-                achieves 0.6924 × C*, but the quantum approach has different scaling properties
-                and may outperform classical methods on specific graph families.
+                For unweighted graphs (all w=1), the circuit reduces to the standard QAOA formulation.
+                Weighted QAOA is strictly more general and handles all real-world problem instances.
                 """
             )
 
         st.divider()
 
-        # ── 2. Parameter optimisation ───────────────────────────────────────
-        st.markdown("### Optimising QAOA Parameters  (γ, β)")
+        # ── 2. Parameter optimisation ──────────────────────────────────────
+        st.markdown(f"### Parameter Optimisation  (p = {p_layers})")
+        weight_str = "weighted " if use_weights else ""
         st.markdown(
-            f"""
-            QAOA requires finding the angles **γ** (cost-layer rotation) and **β**
-            (mixer-layer rotation) that maximise the expected cut value ⟨C⟩.
-
-            For **p = {p_layers}** {'layer' if p_layers == 1 else 'layers'} there are
-            **{2 * p_layers}** angles to optimise.  We use a **{10}×{10} grid search**
-            followed by **Nelder-Mead** local refinement.  All grid circuits are run
-            simultaneously in a single batch on the Aer simulator (256 shots each).
-            """
+            f"Grid search over {10}×{10} (γ,β) pairs maximising {weight_str}⟨C⟩ (256 shots each), "
+            "then Nelder-Mead refinement."
         )
 
-        with st.spinner("Running parameter optimisation (grid search + refinement)…"):
+        with st.spinner("Optimising parameters…"):
             try:
-                opt_gamma, opt_beta, opt_exp, landscape_data = optimize_qaoa_params(
-                    n_nodes, edges, p=p_layers, grid_size=10, grid_shots=256
+                opt_gamma, opt_beta, opt_exp, ld = optimize_qaoa_params(
+                    n_nodes, edges, p=p_layers, grid_size=10, grid_shots=256, weights=weights
                 )
                 st.success(
-                    f"Optimal parameters found — γ* = {[f'{g:.3f}' for g in opt_gamma]}, "
+                    f"γ* = {[f'{g:.3f}' for g in opt_gamma]}, "
                     f"β* = {[f'{b:.3f}' for b in opt_beta]}  →  "
-                    f"⟨C⟩ = **{opt_exp:.3f}**  (C* = {max_cut}, "
-                    f"ratio = {opt_exp/max_cut:.3f})"
+                    f"⟨C⟩ = **{opt_exp:.3f}** / C* = {max_cut:.2f}  "
+                    f"(ratio = {opt_exp/max_cut:.3f})"
                 )
             except Exception as e:
                 st.error(f"Optimisation failed: {e}")
-                opt_gamma, opt_beta = [0.5] * p_layers, [0.3] * p_layers
-                opt_exp = 0.0
-                landscape_data = None
+                opt_gamma, opt_beta, opt_exp, ld = [0.5]*p_layers, [0.3]*p_layers, 0.0, None
 
-        if landscape_data is not None and p_layers == 1:
-            gamma_vals, beta_vals, landscape = landscape_data
-            fig_landscape = qaoa_viz.plot_optimization_landscape(
-                gamma_vals, beta_vals, landscape,
-                opt_gamma[0], opt_beta[0], graph_choice.split("(")[0].strip()
+        if ld is not None and p_layers == 1:
+            fig = qaoa_viz.plot_optimization_landscape(
+                ld[0], ld[1], ld[2], opt_gamma[0], opt_beta[0],
+                graph_choice.split("(")[0].strip()
             )
-            st.pyplot(fig_landscape)
-            plt_close(fig_landscape)
-
-            with st.expander("Reading the optimisation landscape"):
-                st.markdown(
-                    """
-                    The colour encodes ⟨C⟩ — brighter = more edges cut on average.  You can see:
-
-                    - **Smooth structure**: the landscape is not random.  QAOA theory predicts a
-                      periodicity in γ (period 2π) and β (period π/2) for Max-Cut.
-                    - **Multiple local optima**: the landscape has several bright regions.  A poor
-                      starting point for gradient descent can get trapped; grid search avoids this.
-                    - **Quantum interference at work**: the pattern of light and dark regions reflects
-                      constructive/destructive interference between the cost and mixer unitaries.
-                      The star marks the global maximum found — this is where our QAOA circuit runs.
-                    """
-                )
+            st.pyplot(fig); plt_close(fig)
 
         st.divider()
 
-        # ── 3. Build circuit and show diagram ────────────────────────────────
+        # ── 3. Circuit ─────────────────────────────────────────────────────
+        opt_circuit = build_qaoa_circuit(n_nodes, edges, opt_gamma, opt_beta, p_layers, weights=weights)
+        gate_ops    = opt_circuit.count_ops()
+        depth       = opt_circuit.depth(filter_function=lambda i: i.operation.name != "measure")
+
         st.markdown(f"### QAOA Circuit  (p = {p_layers})")
         st.markdown(
-            f"""
-            The optimised QAOA circuit for this graph has **{n_nodes} qubits** and
-            **{p_layers}** alternating cost-mixer layer{'s' if p_layers > 1 else ''}.
-
-            **Reading the circuit:**
-            - **H gates** — initialise each qubit in the |+⟩ state (equal superposition)
-            - **CNOT–Rz–CNOT triplets** — implement e^(−iγ ZᵤZᵥ) for each edge (u, v)
-            - **Rx gates** — implement e^(−iβ Xᵢ) on each qubit (mixer layer)
-            - **Measurement** — collapse the quantum state to a classical bitstring
-
-            Each bitstring is a candidate partition.  After many shots, the most frequent
-            bitstring is the QAOA solution.
-            """
+            f"Depth = **{depth}** · "
+            f"Total gates = **{sum(gate_ops.values()) - gate_ops.get('measure',0)}** · "
+            f"CX = **{gate_ops.get('cx',0)}**"
+            + (" · Rz angles scaled by edge weights" if use_weights else "")
         )
-
-        opt_circuit = build_qaoa_circuit(n_nodes, edges, opt_gamma, opt_beta, p_layers)
-        fig_circ = qaoa_viz.plot_qaoa_circuit(opt_circuit)
-        st.pyplot(fig_circ)
-        plt_close(fig_circ)
-
-        circuit_depth = opt_circuit.depth(
-            filter_function=lambda inst: inst.operation.name != "measure"
-        )
-        circuit_gates = opt_circuit.count_ops()
-        cx_count = circuit_gates.get("cx", 0)
-        st.caption(
-            f"Circuit stats: depth = **{circuit_depth}**, total gates = "
-            f"**{sum(circuit_gates.values()) - circuit_gates.get('measure', 0)}**, "
-            f"CX gates = **{cx_count}**"
-        )
+        fig = qaoa_viz.plot_qaoa_circuit(opt_circuit)
+        st.pyplot(fig); plt_close(fig)
 
         st.divider()
 
-        # ── 4. Transpilation comparison ──────────────────────────────────────
-        st.markdown("### Transpilation Analysis  (Optimisation Levels 0–3)")
+        # ── 4. Transpilation ───────────────────────────────────────────────
+        st.markdown("### Transpilation Analysis  (Levels 0–3)")
         st.markdown(
-            """
-            Real quantum hardware has restricted connectivity (not every qubit can interact
-            with every other) and only supports a small set of **native basis gates**
-            (typically CX, RZ, SX, X on IBM devices).  *Transpilation* maps the abstract
-            QAOA circuit onto these hardware constraints.
-
-            Qiskit offers four optimisation levels that balance compilation speed against
-            circuit quality:
-
-            | Level | Strategy | Use case |
-            |-------|----------|----------|
-            | **0** | Trivial layout + no optimisation | Fast prototyping |
-            | **1** | SABRE routing + basic peephole rewrites | Default |
-            | **2** | More aggressive 1Q/2Q gate merging | Production |
-            | **3** | Full transpiler stack: commutativity, pulse-efficient 2Q | Best quality |
-
-            We transpile to a **simulated 5-qubit IBM backend** with a T-shape coupling map
-            (matching real IBM Tenerife/Nairobi topology).  The key metric is the
-            **2-qubit gate count** — each CX gate introduces ~1% error on real hardware.
-            """
+            "Transpilation maps the abstract circuit to IBM native gates (CX, RZ, SX, X) on a "
+            "5-qubit T-shape coupling map.  Higher optimisation levels reduce 2-qubit gate count, "
+            "directly lowering error accumulation on real hardware."
         )
-
-        with st.spinner("Running transpilation comparison at levels 0–3…"):
+        with st.spinner("Transpiling at levels 0–3…"):
             try:
                 transp_results = compare_transpilation_levels(opt_circuit)
             except Exception as e:
-                st.error(f"Transpilation comparison failed: {e}")
-                transp_results = []
+                st.error(f"Transpilation failed: {e}"); transp_results = []
 
         if transp_results:
-            fig_transp = qaoa_viz.plot_transpilation_comparison(transp_results)
-            st.pyplot(fig_transp)
-            plt_close(fig_transp)
+            fig = qaoa_viz.plot_transpilation_comparison(transp_results)
+            st.pyplot(fig); plt_close(fig)
 
-            with st.expander("Why does gate count matter so much?"):
-                st.markdown(
-                    """
-                    Every gate applied to a real quantum chip accumulates error:
-                    - **1-qubit gates**: ~0.05–0.1% error rate
-                    - **2-qubit (CX) gates**: ~0.5–1.5% error rate — roughly **10× worse**
-
-                    For a QAOA circuit with d CX gates, the expected fidelity scales roughly as
-                    (1 − p_2q)^d.  At p_2q = 1% and d = 20 gates, fidelity ≈ (0.99)^20 ≈ 82%.
-                    At d = 40, it drops to ~67%.  Optimisation level 3 minimises d, directly
-                    improving the probability of getting the correct answer on real hardware.
-
-                    **SWAP overhead:** Qubits on real chips can only directly interact with
-                    neighbours.  For non-neighbouring pairs, the transpiler must insert SWAP gates
-                    (each costs 3 CX gates).  Better routing algorithms (levels 2–3) find more
-                    efficient paths, reducing SWAP overhead.
-                    """
-                )
-
-            st.divider()
-
-            # ── 5. Qubit mapping ─────────────────────────────────────────────
-            st.markdown("### Qubit Mapping  (Virtual → Physical Qubits)")
-            st.markdown(
-                """
-                The coupling-map diagram below shows the 5-qubit IBM T-shape topology.
-                Each circle is a physical qubit; colour shows which virtual (circuit) qubit
-                it is assigned to.  Grey nodes are unused.
-
-                **Why does the mapping matter?**
-                If two circuit qubits that need to interact are mapped to non-adjacent physical
-                qubits, the transpiler must insert SWAP chains — each adding 3 CX gates and
-                ~3% extra error.  A clever layout (levels 2–3) places frequently-interacting
-                qubits next to each other, minimising SWAPs.
-                """
-            )
-            fig_mapping = qaoa_viz.plot_qubit_mapping(
+            st.markdown("#### Qubit Mapping")
+            fig = qaoa_viz.plot_qubit_mapping(
                 transp_results, n_nodes, COUPLING_MAP_EDGES, PHYS_QUBIT_POS
             )
-            st.pyplot(fig_mapping)
-            plt_close(fig_mapping)
-
-            # Show mapping table
-            for r in transp_results:
-                if r["qubit_mapping"]:
-                    mapping_str = ", ".join(
-                        f"v{v} → P{p}" for v, p in sorted(r["qubit_mapping"].items())
-                    )
-                    st.caption(f"Level {r['level']}: {mapping_str}")
+            st.pyplot(fig); plt_close(fig)
 
         st.divider()
 
-        # ── 6. Noise model explanation ───────────────────────────────────────
-        st.markdown("### IBM Aer Noise Model")
+        # ── 5. Ideal / Noisy / Mitigated ──────────────────────────────────
+        st.markdown("### Ideal · Noisy · Measurement-Error-Mitigated")
         st.markdown(
-            """
-            To simulate realistic performance on IBM quantum hardware, we build a composite
-            noise model with three error channels:
-
-            | Error channel | Rate | Physical origin |
-            |---------------|------|-----------------|
-            | **Thermal relaxation** (T₁/T₂) | T₁ = 50 µs, T₂ = 70 µs | Qubit decays to ground state; dephasing from environment |
-            | **Depolarising** (single-qubit) | ~0.1% per gate | Gate imperfections, calibration drift |
-            | **Depolarising** (CX gate) | ~1.0% per gate | Cross-resonance control imperfections |
-            | **Readout assignment** | ~1.5% per qubit | Measurement crosstalk, threshold errors |
-
-            **Thermal relaxation** is the dominant long-timescale error: if a qubit waits
-            idle for too long (relative to T₁), it spontaneously emits a photon and flips
-            from |1⟩ to |0⟩.  T₂ captures dephasing — random phase kicks that destroy
-            quantum coherence without changing energy.
-
-            **Depolarising noise** replaces the intended gate output with a random Pauli
-            (X, Y, Z, I) with equal probability p/4 each.  This is a standard model for
-            gate crosstalk and pulse imperfections.
-
-            **Readout error** is a classical error: the qubit is in state |1⟩ but the
-            measurement electronics report 0 (or vice versa).  This can be corrected
-            post-measurement using *measurement error mitigation*.
-
-            The noise scale slider (used in later plots) multiplies all error rates while
-            simultaneously dividing T₁/T₂ — modelling a range from near-ideal (scale → 0)
-            to heavily noisy (scale = 5×).
-            """
+            "Three simulation runs: **Ideal** (no noise), **Noisy** (full IBM model), "
+            "**Mitigated** (noisy + calibration-matrix readout correction).  "
+            "Mitigation corrects readout errors but not gate errors."
         )
-
-        # ── 7. Ideal vs Noisy vs Mitigated ──────────────────────────────────
-        st.markdown("### Ideal · Noisy · Measurement-Error-Mitigated Comparison")
-        st.markdown(
-            """
-            We run the same optimised QAOA circuit under three conditions:
-
-            1. **Ideal** — Aer statevector-accurate simulation (no noise).
-               This is the best possible QAOA answer given the circuit angles.
-            2. **Noisy** — Aer simulation with the full IBM noise model (gate errors +
-               thermal relaxation + readout errors).  This approximates what you would
-               see running on real IBM hardware today.
-            3. **Mitigated** — Noisy simulation with *measurement error mitigation* (MEM)
-               applied.  MEM uses 2ⁿ calibration circuits to estimate the readout error
-               matrix, then inverts it to correct the observed counts.
-
-            Note: MEM corrects *readout* errors only.  Gate errors (the larger contribution)
-            remain.  The mitigated result is better than raw noisy but still below ideal.
-            """
-        )
-
-        with st.spinner("Running ideal / noisy / mitigated simulations (2048 shots each)…"):
+        with st.spinner("Running ideal / noisy / mitigated (2048 shots each)…"):
             try:
                 baseline_nm = build_ibm_noise_model(scale=1.0)
-                comparison = run_three_way_comparison(
-                    opt_circuit, baseline_nm, n_nodes, shots=2048
-                )
+                comparison  = run_three_way_comparison(opt_circuit, baseline_nm, n_nodes, shots=2048)
             except Exception as e:
-                st.error(f"Three-way comparison failed: {e}")
-                comparison = None
+                st.error(f"Three-way comparison failed: {e}"); comparison = None
 
         if comparison:
-            fig_compare = qaoa_viz.plot_ideal_vs_noisy_vs_mitigated(
-                comparison, edges, n_nodes, max_cut
+            fig = qaoa_viz.plot_ideal_vs_noisy_vs_mitigated(
+                comparison, edges, n_nodes, max_cut, weights=weights
             )
-            st.pyplot(fig_compare)
-            plt_close(fig_compare)
+            st.pyplot(fig); plt_close(fig)
+            fig = qaoa_viz.plot_solution_distribution(
+                comparison, edges, n_nodes, max_cut, weights=weights
+            )
+            st.pyplot(fig); plt_close(fig)
 
-            ideal_cut  = compute_expected_cut(comparison["ideal"],     edges, n_nodes)
-            noisy_cut  = compute_expected_cut(comparison["noisy"],     edges, n_nodes)
-            mitig_cut  = compute_expected_cut(comparison["mitigated"], edges, n_nodes)
-            noise_penalty = ideal_cut - noisy_cut
-            mitig_gain    = mitig_cut - noisy_cut
+            ideal_cut = compute_expected_cut(comparison["ideal"],     edges, n_nodes, weights=weights)
+            noisy_cut = compute_expected_cut(comparison["noisy"],     edges, n_nodes, weights=weights)
+            mitig_cut = compute_expected_cut(comparison["mitigated"], edges, n_nodes, weights=weights)
 
-            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-            col_m1.metric("Ideal ⟨C⟩",     f"{ideal_cut:.3f}",  f"Ratio {ideal_cut/max_cut:.3f}")
-            col_m2.metric("Noisy ⟨C⟩",     f"{noisy_cut:.3f}",  f"−{noise_penalty:.3f} vs ideal")
-            col_m3.metric("Mitigated ⟨C⟩", f"{mitig_cut:.3f}",  f"+{mitig_gain:.3f} vs noisy")
-            col_m4.metric("Classical C*",   str(max_cut),         "Optimum")
-
-            with st.expander("How does measurement error mitigation work?"):
-                st.markdown(
-                    f"""
-                    **Step 1 — Calibration:**
-                    Prepare each of the **2^{n_nodes} = {2**n_nodes}** computational basis
-                    states (|000…0⟩, |000…1⟩, …, |111…1⟩) and measure them through the noisy
-                    device.  Record the **calibration matrix** A where A[j, i] = P(measuring
-                    bitstring j | we prepared state i).
-
-                    **Step 2 — Inversion:**
-                    For the actual QAOA measurement vector **p_noisy**, compute:
-                    > **p_corrected** = A⁻¹ · **p_noisy**
-
-                    **Step 3 — Post-process:**
-                    Clip negative entries (which arise from statistical fluctuations or
-                    ill-conditioning) and renormalise to get a valid probability distribution.
-
-                    **Limitations:**
-                    - Calibration itself is noisy (4096 shots used here).
-                    - Gate errors are **not** corrected — only readout.
-                    - For n > 7 qubits, the 2^n circuits become expensive.
-                      Methods like M3 (matrix-free measurement mitigation) scale to ~127 qubits
-                      by exploiting sparsity in the calibration matrix.
-                    """
-                )
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Ideal ⟨C⟩",     f"{ideal_cut:.3f}", f"Ratio {ideal_cut/max_cut:.3f}")
+            c2.metric("Noisy ⟨C⟩",     f"{noisy_cut:.3f}", f"−{ideal_cut-noisy_cut:.3f}")
+            c3.metric("Mitigated ⟨C⟩", f"{mitig_cut:.3f}", f"+{mitig_cut-noisy_cut:.3f} vs noisy")
+            c4.metric("Classical C*",   f"{max_cut:.2f}")
 
             st.divider()
 
-            # ── 8. Solution distribution ─────────────────────────────────────
-            st.markdown("### Solution Probability Distribution")
-            st.markdown(
-                """
-                Each bar represents a candidate partition (bitstring).  Bitstrings are ordered
-                left → right by increasing cut value, so the **rightmost columns** are the best
-                solutions.  Three bars per bitstring show how noise redistributes probability
-                mass away from optimal solutions.
-
-                **What to look for:**
-                - In the ideal run, probability concentrates on high-cut bitstrings.
-                - In the noisy run, the distribution flattens — noise causes random bit flips
-                  that make suboptimal partitions appear more probable.
-                - Mitigation partially restores the ideal shape (readout correction), but gate
-                  errors still cause bleed toward lower-cut bitstrings.
-                """
-            )
-            fig_dist = qaoa_viz.plot_solution_distribution(
-                comparison, edges, n_nodes, max_cut
-            )
-            st.pyplot(fig_dist)
-            plt_close(fig_dist)
-
-            st.divider()
-
-            # ── 9. Noise sweep ───────────────────────────────────────────────
-            st.markdown("### Performance vs. Noise Strength")
-            st.markdown(
-                """
-                We now vary the noise scale factor from **0** (ideal) to **5×** the baseline
-                IBM noise and measure how QAOA quality degrades.
-
-                This sweep answers the key engineering question:
-                *"How bad can the noise get before QAOA stops being useful?"*
-
-                The **random baseline** (⟨C⟩ = C*/2) is the expected cut from a random
-                partition — the minimum bar for any algorithm to be useful.  When QAOA's
-                expected cut drops below this, the circuit is too noisy to provide any signal.
-                """
-            )
-
-            with st.spinner("Running noise sweep (7 noise levels × 1024 shots each)…"):
+            # ── 6. Noise sweep ─────────────────────────────────────────────
+            st.markdown("### Performance vs Noise Strength")
+            with st.spinner("Running noise sweep…"):
                 try:
-                    sweep_results = noise_sweep(
-                        opt_circuit, edges, n_nodes,
-                        scale_factors=[0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0],
-                        shots=1024,
-                    )
+                    sweep = noise_sweep(opt_circuit, edges, n_nodes,
+                                        scale_factors=[0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0],
+                                        shots=1024, weights=weights)
+                    fig = qaoa_viz.plot_noise_sweep(sweep, max_cut)
+                    st.pyplot(fig); plt_close(fig)
                 except Exception as e:
                     st.error(f"Noise sweep failed: {e}")
-                    sweep_results = []
-
-            if sweep_results:
-                fig_sweep = qaoa_viz.plot_noise_sweep(sweep_results, max_cut)
-                st.pyplot(fig_sweep)
-                plt_close(fig_sweep)
-
-                # Find the noise threshold
-                threshold_scale = None
-                for r in sweep_results:
-                    if r["approx_ratio"] < 0.5:
-                        threshold_scale = r["scale"]
-                        break
-
-                if threshold_scale:
-                    st.info(
-                        f"QAOA advantage is lost at noise scale ≈ **{threshold_scale}×** "
-                        "— beyond this, a random partition does equally well."
-                    )
-                else:
-                    st.info(
-                        "QAOA maintains advantage over random guessing across all tested "
-                        "noise levels — a sign of a robust circuit for this graph."
-                    )
-
-                with st.expander("Interpreting the noise sweep"):
-                    st.markdown(
-                        """
-                        **The noise scale factor is defined as:**
-                        - Scale 0.0 → no noise (ideal simulation)
-                        - Scale 1.0 → baseline IBM hardware noise (T₁=50µs, ~1% CX error)
-                        - Scale 2.0 → twice as noisy (shorter coherence, higher gate error rates)
-                        - Scale 5.0 → severely noisy — approximates early NISQ prototypes or
-                          very long, deep circuits running at the edge of coherence
-
-                        **Why does quality degrade linearly at first, then catastrophically?**
-                        For small noise, errors introduce small perturbations to the probability
-                        distribution.  The expected cut decreases slowly.  At a critical noise
-                        level, decoherence destroys the quantum coherence that QAOA relies on —
-                        the circuit output approaches a maximally mixed state, giving random
-                        results.  This transition is the **noise threshold** for this circuit.
-
-                        **Implications for hardware roadmaps:**
-                        To run QAOA circuits with p=3 on 50-qubit graphs — the scale needed for
-                        commercial relevance — error rates must drop below ~0.1% per CX gate.
-                        Current IBM devices are at ~0.5–1%, so roughly a 5–10× improvement is
-                        needed.  IBM's roadmap targets this with error-corrected logical qubits
-                        by ~2029.
-                        """
-                    )
-
-                st.divider()
-
-            # ── 10. Depth–quality sweep ──────────────────────────────────────
-            st.markdown("### Circuit Depth vs. Solution Quality  (p = 1, 2, 3 Layers)")
-            st.markdown(
-                """
-                Deeper circuits (more QAOA layers) should improve the approximation ratio —
-                with p→∞, QAOA converges to the exact optimum.  But on noisy hardware,
-                deeper circuits accumulate more gate errors, potentially *worsening* performance.
-
-                This trade-off — the **noise–depth dilemma** — is one of the central
-                challenges of NISQ-era quantum computing.  The optimal p depends on:
-                - Hardware error rates (lower error → can use larger p)
-                - Graph structure (some graphs benefit more from deeper circuits)
-                - Coherence times (T₁, T₂ must exceed circuit duration)
-
-                **We use fixed angles** (γ = 0.5, β = 0.3) across all p to isolate the
-                depth effect — note that proper per-p optimisation would improve all bars.
-                """
-            )
-
-            with st.spinner("Running depth–quality sweep (p = 1, 2, 3)…"):
-                try:
-                    dq_results = depth_quality_sweep(
-                        n_nodes, edges, max_cut,
-                        baseline_nm,
-                        p_values=[1, 2, 3],
-                        shots=1024,
-                    )
-                except Exception as e:
-                    st.error(f"Depth–quality sweep failed: {e}")
-                    dq_results = []
-
-            if dq_results:
-                fig_dq = qaoa_viz.plot_depth_quality(dq_results, max_cut)
-                st.pyplot(fig_dq)
-                plt_close(fig_dq)
-
-                with st.expander("The noise–depth dilemma in detail"):
-                    st.markdown(
-                        """
-                        **Why does the ideal curve improve with p but the noisy curve may not?**
-
-                        In the *ideal* case, each additional QAOA layer applies an extra round
-                        of cost + mixer unitaries.  This is analogous to more Trotter steps in
-                        adiabatic evolution — the quantum state gets progressively closer to the
-                        ground state of H_C (the optimal solution).
-
-                        In the *noisy* case, each additional layer also adds:
-                        - 2|E| new CX gates (cost layer: one CX–Rz–CX triplet per edge)
-                        - n new Rx gates (mixer layer)
-                        - Additional idle time (more decoherence)
-
-                        The signal-to-noise ratio of each layer diminishes as the circuit
-                        gets longer.  At some critical depth p*, the noise benefit outweighs
-                        the algorithmic benefit, and the noisy expected cut *decreases*.
-
-                        **What this means for quantum error correction (QEC):**
-                        The only way to run QAOA at large p without noise destroying the
-                        result is to use **fault-tolerant quantum gates** — gates with logical
-                        error rates below ~10⁻⁶ achieved via quantum error correction codes
-                        (e.g., the surface code).  This requires ~1000 physical qubits per
-                        logical qubit.  Once we have fault-tolerant machines, the depth limit
-                        on QAOA is removed, and the algorithm can run to large p for
-                        genuinely hard problem instances.
-                        """
-                    )
 
             st.divider()
 
-        # ── Summary ──────────────────────────────────────────────────────────
-        st.markdown("### Summary: Key Takeaways")
+            # ── 7. Depth–quality sweep ─────────────────────────────────────
+            st.markdown("### Circuit Depth vs Solution Quality  (p = 1, 2, 3)")
+            st.markdown(
+                "More layers → better ideal approximation, but deeper circuits accumulate more "
+                "noise.  This tension is the central challenge of NISQ-era quantum optimisation."
+            )
+            with st.spinner("Running depth–quality sweep…"):
+                try:
+                    dq = depth_quality_sweep(n_nodes, edges, max_cut, baseline_nm,
+                                             p_values=[1,2,3], shots=1024, weights=weights)
+                    fig = qaoa_viz.plot_depth_quality(dq, max_cut)
+                    st.pyplot(fig); plt_close(fig)
+                except Exception as e:
+                    st.error(f"Depth–quality sweep failed: {e}")
+
+            st.divider()
+
+            # ── 8. ★ Zero-Noise Extrapolation (ZNE) ───────────────────────
+            st.markdown("### Zero-Noise Extrapolation (ZNE)")
+            st.markdown(
+                """
+                ZNE runs the circuit at noise levels **λ = 1, 2, 3, 4** (achieved here by
+                scaling IBM noise model error rates by λ; on real hardware, *gate folding* is
+                used instead).  A **linear** and a **quadratic** polynomial are fitted to the
+                measured ⟨C(λ)⟩ values and extrapolated to λ=0 — the estimated noiseless result.
+
+                This technique requires no extra qubits, works on any circuit, and is used in
+                production by IBM Quantum and Google for their leading NISQ experiments.
+                Comparing ZNE to the ideal simulation shows how close extrapolation gets to
+                the true noiseless value.
+                """
+            )
+
+            with st.spinner("Running ZNE (4 noise levels × 1024 shots)…"):
+                try:
+                    zne_result = run_zne(
+                        opt_circuit, edges, n_nodes,
+                        scale_factors=[1, 2, 3, 4],
+                        shots=1024, weights=weights,
+                    )
+                    fig = qaoa_viz.plot_zne(zne_result, ideal_cut, max_cut)
+                    st.pyplot(fig); plt_close(fig)
+
+                    zl  = zne_result["zne_linear"]
+                    zq  = zne_result["zne_quadratic"]
+                    z1  = zne_result["scale_data"][0]["expected_cut"]  # noisy at λ=1
+
+                    cz1, cz2, cz3, cz4 = st.columns(4)
+                    cz1.metric("Noisy ⟨C⟩  (λ=1)", f"{z1:.3f}")
+                    cz2.metric("ZNE Linear",         f"{zl:.3f}",
+                               f"+{zl-z1:.3f} vs noisy")
+                    if zq is not None:
+                        cz3.metric("ZNE Quadratic",  f"{zq:.3f}",
+                                   f"+{zq-z1:.3f} vs noisy")
+                    cz4.metric("Ideal (target)",     f"{ideal_cut:.3f}")
+
+                    with st.expander("Why does ZNE work?"):
+                        st.markdown(
+                            f"""
+                            In the low-noise limit, the expected value ⟨C(λ)⟩ can be
+                            Taylor-expanded around λ=0:
+
+                            > ⟨C(λ)⟩ ≈ ⟨C⟩_ideal + a·λ + b·λ² + …
+
+                            By evaluating this function at λ=1,2,3,4 we obtain a system of
+                            equations that lets us back-solve for ⟨C⟩_ideal = ⟨C(0)⟩.
+
+                            For this circuit:
+                            - **Noisy baseline** (λ=1): ⟨C⟩ = {z1:.3f}
+                            - **ZNE linear estimate**: {zl:.3f}  (improvement: +{zl-z1:.3f})
+                            {'- **ZNE quadratic estimate**: ' + f'{zq:.3f}' if zq is not None else ''}
+                            - **Ideal** (ground truth): {ideal_cut:.3f}
+
+                            ZNE works best when the noise is truly weakly-coupled (each gate
+                            introduces a small independent error).  It degrades if the circuit
+                            is already deeply in the noise-dominated regime (scale > 3×).
+                            """
+                        )
+                except Exception as e:
+                    st.error(f"ZNE failed: {e}")
+
+            st.divider()
+
+            # ── 9. ★ Goemans–Williamson SDP ───────────────────────────────
+            st.markdown("### Goemans–Williamson SDP Comparison")
+            st.markdown(
+                """
+                The **Goemans–Williamson** (1995) algorithm is the best known classical
+                polynomial-time approximation algorithm for weighted Max-Cut, achieving ≥ **0.878 × C***
+                in expectation.  It solves a semidefinite programme (SDP) to find optimal unit vectors
+                for each vertex, then uses **200 random hyperplane rounding** trials.
+
+                Plotting GW alongside QAOA provides a direct classical benchmark:
+                if QAOA exceeds the GW rounded cut on a hard graph, it demonstrates a form
+                of quantum advantage.
+                """
+            )
+
+            if not HAS_CVXPY:
+                st.warning("cvxpy not installed — run `pip install cvxpy` to enable Goemans–Williamson.")
+            else:
+                with st.spinner("Solving SDP and running hyperplane rounding (200 rounds)…"):
+                    try:
+                        gw_result = goemans_williamson(n_nodes, edges, weights=weights, n_rounds=200)
+                        fig = qaoa_viz.plot_gw_comparison(gw_result, ideal_cut, max_cut, graph_choice)
+                        st.pyplot(fig); plt_close(fig)
+
+                        gw_cut   = gw_result["gw_cut"]
+                        sdp_bd   = gw_result["sdp_bound"]
+                        gw_ratio = gw_result["approx_ratio"]
+                        qa_ratio = ideal_cut / max_cut if max_cut > 0 else 0
+
+                        cg1, cg2, cg3, cg4 = st.columns(4)
+                        cg1.metric("Classical C*",       f"{max_cut:.3f}")
+                        cg2.metric("GW SDP Bound",       f"{sdp_bd:.3f}",
+                                   f"{sdp_bd/max_cut:.3f}×C*")
+                        cg3.metric("GW Rounded",         f"{gw_cut:.3f}",
+                                   f"{gw_ratio:.3f}×C*")
+                        cg4.metric("QAOA (Ideal)",       f"{ideal_cut:.3f}",
+                                   f"{qa_ratio:.3f}×C*")
+
+                        if ideal_cut >= gw_cut:
+                            st.success(
+                                f"QAOA ({ideal_cut:.3f}) ≥ GW rounded ({gw_cut:.3f}) — "
+                                "the quantum circuit matches or beats the classical approximation!"
+                            )
+                        else:
+                            st.info(
+                                f"GW rounded ({gw_cut:.3f}) > QAOA ({ideal_cut:.3f}) — "
+                                "GW wins here.  Increasing p or optimising parameters further "
+                                "could close the gap."
+                            )
+
+                        with st.expander("Understanding the SDP bound vs rounded cut"):
+                            st.markdown(
+                                f"""
+                                The **SDP bound** ({sdp_bd:.3f}) is an *upper bound* on C* —
+                                the SDP relaxation allows fractional solutions (unit vectors) rather
+                                than binary partitions.  It is always ≥ the true Max-Cut.
+
+                                The **GW rounded** cut ({gw_cut:.3f}) is what hyperplane rounding
+                                achieves in the best of 200 trials.  The gap between the SDP bound
+                                and the rounded cut is the *integrality gap* — an inherent feature
+                                of rounding continuous solutions to binary ones.
+
+                                The **GW guarantee** (0.878×C* = {0.878*max_cut:.3f} here) is a
+                                worst-case lower bound over all graphs.  On many practical instances
+                                GW performs significantly better.
+
+                                QAOA explores the solution space via quantum superposition and
+                                interference rather than SDP + rounding.  For some graph families
+                                (e.g. dense random graphs at large p) QAOA can outperform GW — this
+                                is an active research area and one of the most exciting open questions
+                                in quantum optimisation.
+                                """
+                            )
+                    except Exception as e:
+                        st.error(f"Goemans–Williamson failed: {e}")
+
+        st.divider()
+        st.markdown("### Summary")
         st.markdown(
             f"""
-            This analysis demonstrated QAOA on the **{graph_choice}** graph with p = {p_layers} layer(s):
+            **Graph:** {graph_choice} · **p = {p_layers}** · {'Weighted' if use_weights else 'Unweighted'}
 
-            **Algorithm:**
-            - QAOA is a variational hybrid quantum-classical algorithm for combinatorial optimisation.
-            - The circuit alternates cost (ZZ) and mixer (X) layers, parameterised by angles (γ, β).
-            - Optimising (γ, β) is a classical outer-loop problem solved here by grid search.
+            | Method | ⟨C⟩ / Value | Ratio vs C*={max_cut:.2f} |
+            |--------|------------|--------------------------|
+            | Classical brute force | {max_cut:.3f} | 1.000 |
+            | QAOA ideal | {opt_exp:.3f} | {opt_exp/max_cut:.3f} |
+            | QAOA noisy (IBM model) | — | see plots |
+            | ZNE extrapolated | — | see plots |
+            | Goemans–Williamson | — | ≥ 0.878 (guaranteed) |
 
-            **Transpilation:**
-            - Optimisation level 3 reduces the 2-qubit gate count by routing qubits more intelligently.
-            - Fewer CX gates → lower accumulated error → higher probability of correct answer on hardware.
-
-            **Noise effects:**
-            - Even at baseline IBM noise (scale = 1×), QAOA quality degrades measurably.
-            - Measurement error mitigation recovers some of the lost quality at low cost (2^n extra circuits).
-            - Gate errors — the dominant noise source — require more powerful techniques
-              (zero-noise extrapolation, probabilistic error cancellation, or full error correction).
-
-            **Depth–quality trade-off:**
-            - More QAOA layers improve the theoretical approximation ratio (closer to C* = {max_cut}).
-            - But on noisy hardware, deeper circuits lose more to decoherence.
-            - This tension is the central open problem in NISQ-era quantum optimisation.
-
-            **Broader impact:**
-            - QAOA is a prototype for the class of variational quantum algorithms that will likely
-              be the first to demonstrate practical quantum advantage.
-            - As hardware improves (lower error rates, longer coherence, more qubits), the problems
-              QAOA can tackle will scale up — from toy graphs to industrially relevant instances
-              with hundreds of variables.
-            - This is why every gate saved by the transpiler, every error mitigated by post-processing,
-              and every qubit preserved by better materials brings the field closer to a genuine
-              quantum advantage over classical computing.
+            **Key lessons:**
+            - Weighted QAOA naturally handles non-uniform edge importance via scaled Rz angles.
+            - ZNE recovers significant signal from noisy circuits with no extra qubits.
+            - GW is a powerful classical benchmark — quantum advantage requires beating it consistently.
+            - Deeper circuits (larger p) improve the ideal approximation but suffer more from noise,
+              making error mitigation and fault-tolerant hardware essential for large-scale QAOA.
             """
         )
