@@ -7,3 +7,4 @@ pylatexenc>=2.10
 numpy>=1.24
 scipy>=1.10
 cvxpy>=1.4
+plotly>=5.18
